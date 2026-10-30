@@ -299,17 +299,147 @@ checked it, and what came of it).
 
 Take one problem from Milestone 1 or 2 and propose the boundary that fixes it.
 
+Problem chosen: Milestone 2, Finding 2. Each copy has its own in-memory
+booking store, so two copies can both confirm the same room slot.
+
 **The boundary.** The port, what it promises, and which side implements it. Say what
 moves and what stays.
+
+**The port.** A new port, `RoomLedger`, in `core-domain/core/ports/`. It has one
+write call that matters:
+
+```java
+ReserveResult reserve(Booking candidate);   // Confirmed(booking) or Taken(conflicting booking)
+```
+
+**What it promises.** Checking the room and saving the booking happen in one
+step. The ledger locks the room, checks its held bookings with `ConflictChecker`
+(and so with `TimeInterval.overlaps`), saves only if nothing overlaps, and then
+unlocks. Nobody can save in between the check and the save. Cancel and modify go
+through the ledger too, and modify uses the same step.
+
+**Who implements it.** Two sides:
+
+- **The owner:** a new process, `room-ledger`. Inside it, the port is
+  implemented by the existing `InMemoryBookingStore` plus a lock per room.
+- **Each api copy:** a small client, kept in `storage` because storage already
+  implements the ports. It sends form-encoded requests to `room-ledger` and reads
+  a plain-text reply such as `confirmed bk-…` or `taken bk-…`. A text reply
+  means no JSON is parsed (`AGENTS.md:83`).
+
+**What moves behind the boundary:** every booking row, plus the
+check-then-save step that is today in `BookingService.java:112-124`.
+
+**What stays in each copy:**
+- HTTP handling and tokens.
+- `BookingRules`: the duration, alignment and opening-hours checks, which need
+  no data.
+- The rooms and users seed.
+- The waitlist.
+- Event publishing and notifications.
+
+**Why not a shared database with a unique rule on room + time?**
+- A unique key on `(room, start)` does not catch partial overlaps, such as
+  10:00–11:00 against 10:30–11:30.
+- An overlap rule written in SQL would be a second overlap implementation, and
+  `AGENTS.md:45` forbids that.
+- A database driver breaks "no runtime dependencies" (`README.md:8`).
 
 **Who owns the data.** Name the module that owns the data this boundary is about,
 and say what everybody else is allowed to do with it.
 
+**`room-ledger` owns every booking row.** It is the only component that may save,
+cancel or change a booking.
+
+What the api copies may do:
+- **Write:** only through `reserve`, `cancel` and `modify`. Never with a direct
+  save.
+- **Read:** they may read bookings (for availability and "my bookings"), but
+  never keep a copy of them between requests.
+
 **The one invariant that must not cross.** Exactly one, stated so that a reader
 can tell whether a given piece of code violates it.
 
+**A room slot is confirmed at most once.** In code terms: no code outside
+`room-ledger` saves a held booking. Any `bookings.save(...)` reachable from an
+api copy breaks the invariant, and so does any conflict check that runs in a copy
+and is followed by a separate save.
+
 **What the boundary costs.** An interface to keep, a second implementation to
 maintain, a performance argument to have again. Include what it leaves unfixed.
+
+**Latency.**
+- **Bookings:** each booking adds network round trips to the ledger: one to read
+  the user's own bookings (`BookingService.java:338`) and one for `reserve`.
+- **Availability:** each availability page adds 3 (4 with `minutes`), one per
+  `findConflicts` call (`RoomsHandler.java:80-82` → `AvailabilityService.java:41`).
+- **Expected size:** on one host's Docker network each trip is expected to be
+  around a millisecond; across machines it will be more. To measure it, compare
+  k6 `http_req_duration` p95 before and after.
+
+**Throughput.**
+- Every booking for every room goes through one process.
+- Bookings for the same room wait for each other on the room's lock.
+
+**A new single point of failure.**
+- If `room-ledger` is down, no copy can book, cancel, modify or show
+  availability. Those calls return 503.
+- We choose to refuse rather than book locally, because booking locally is
+  exactly the bug. `GET /rooms` and `/health` still work.
+- The price: booking uptime is now at most the ledger's uptime, however many api
+  copies run.
+
+**Data loss gets bigger.** The ledger is still in memory, so one restart now loses
+every booking for every copy at once. Today a restart only loses one copy's
+bookings. Making the ledger durable is a separate cost.
+
+**More to deploy and run.**
+- One more service in `compose.yaml`, which must be up before `api`.
+- One more health check and one more process to watch.
+- It must always run exactly one copy. Scaling it would bring the bug back.
+
+**Code that has to change.**
+- `core-domain/.../ports/BookingStore.java:12`: copies lose `save`, and
+  `RoomLedger` with `reserve` is added. The fake store in core's tests
+  (`InMemoryStores.java`) and `InMemoryBookingStore` change with it.
+- `BookingService.java:112-124`: check-then-save becomes one `reserve` call.
+- `BookingService.java:200-209`: same change for modify.
+- `BookingService.java:288-306`: same change for waitlist promotion.
+- `CampusReservePlatform.java:44-50`: build the booking service and
+  `AvailabilityService` on the ledger client instead of `StoreRegistry.inMemory()`.
+- `ErrorMapping.java:20`: a new "ledger unavailable" reason maps to 503.
+- **New module:** `AGENTS.md:13` says adding an edge means editing rule 1 first.
+  `room-ledger` is a new module depending on `core-domain` and `storage`.
+- **Tests:** new tests in `core-domain` and `storage` (rule 7), including one
+  where two threads reserve the same slot at once.
+
+**What it leaves unfixed.**
+- **Tokens (Finding 1):** each copy still keeps its own (`TokenService.java:31`),
+  so `token.js` still fails.
+- **Waitlist:** rows and the arrival counter stay per copy
+  (`InMemoryWaitlistStore.java:23`). First-in-first-out only holds within one
+  copy. A cancel on copy 1 only promotes copy 1's waiters
+  (`BookingService.java:152` reads the local waitlist). Promotion can no longer
+  double-book, because it goes through `reserve`.
+- **A user double-booking themselves across copies:** the user's own-calendar
+  check (`BookingService.java:337-345`) is still check-then-act. The invariant
+  covers room slots only.
+- **Event log:** still per copy and in memory (`CampusReservePlatform.java:44`).
+  If a copy crashes after `reserve` but before publishing, the booking is saved
+  with no `booking-created` event.
+
+**How `double_booking.js` would show it works.**
+- **Same script, same command.** The first copy gets `201`. The second gets `202`
+  (waitlisted), because the ledger answers `taken`. So `confirmed_bookings = 1`,
+  which passes `count<=1`, and `checks` and `request_errors` also pass.
+- **Not enough on its own.** The script sends the two requests one after the
+  other. A shared store with a non-atomic check-then-save would also pass it. To
+  test the "one step" promise, send the two requests at the same time
+  (`http.batch`, or many VUs on the same slot). That should still give exactly
+  one 201.
+- **With `room-ledger` stopped**, the script should fail on `checks`, because
+  both copies answer 503. That shows the copies refuse instead of booking
+  locally.
 
 Feel free to read the appendix on what a good proposal looks like in the Lab 3 handout
 before you write this section.
